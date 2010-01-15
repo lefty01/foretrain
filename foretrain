@@ -1,0 +1,953 @@
+#!/usr/bin/perl -w
+
+
+# foretrain: parse gpsbabel (-o gtrnctr) generated garmin xml files.
+# Copyright (c) Andreas Loeffler <andy@exitzero.de>, 2008,2009,2010
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License as
+# published by the Free Software Foundation; either version 2 of
+# the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public
+# License along with this program; if not, write to the Free
+# Software Foundation, Inc., 59 Temple Place, Suite 330, Boston,
+# MA 02111-1307 USA
+
+
+use warnings;
+use strict;
+
+use Getopt::Long qw(:config default no_ignore_case bundling);
+use Pod::Usage;
+use File::Basename;
+use File::Copy;
+use Storable qw(nstore retrieve);
+use XML::Twig;
+use Date::Parse;
+use Geo::Distance;
+use Digest::SHA;
+use DBI;
+
+
+use constant {
+     VERSION => "foretrain version 0.7",	# program version
+     BABELVERSION => "1.3.6",			# min. required gpsbabel version
+};
+
+
+# applications used
+my $gpsbabel = '/usr/local/bin/gpsbabel';
+
+
+my %opt;		# global comand line options
+$opt{verbose}   = 0;	# verbosity level
+my $ntracks     = 0;	# number of tracks in xml file
+my $trackpoints = 0;	# count points for each track
+my $p;			# XML::Parser
+my @TRACKS;
+my @POINTS;
+my $last_trackpt = undef;
+
+
+################################## start ######################################
+parse_commandline();
+
+# default values FIXME: -> follow brians style of config
+$opt{type} = 'elevation' unless defined $opt{type};
+$opt{trackdir} = '/var/www/tracks' unless defined $opt{trackdir};
+$opt{'kml-template'} = "/home/$ENV{USER}/priv/running/kml-template.xml" unless defined $opt{'kml-template'};
+$opt{'database-host'} = 'localhost' unless defined $opt{'database-host'};
+$opt{'database-name'} = 'xxxxxx' unless defined $opt{'database-name'};
+$opt{'remote-host'} = 'exitzero.de' unless defined $opt{'remote-dir'};
+$opt{'remote-user'} = 'user' unless defined $opt{'remote-user'};
+$opt{'remote-dir'} = '/xxx/xxxxxxxxxxxx/xxx/xxxx' unless defined $opt{'remote-dir'};
+
+# printout cmdline options if verbose
+if($opt{verbose}){
+     print VERSION . "\n";
+     foreach (sort keys %opt){
+	  print "opt: ", $_, " -> ", $opt{$_}, "\n" if $opt{$_};
+     }
+}
+
+# Connect to the database.
+my $dbh = DBI->connect("DBI:mysql:database=$opt{'database-name'};host=$opt{'database-host'}",
+		       "xxxxxx", "xxxxxx",
+		       {'RaiseError' => 1});
+
+# alloc geo object to calc track distance
+my $geo = new Geo::Distance;
+
+# create Twig object with two handlers (tracks and trackpoints)
+my $twig= new XML::Twig(
+			twig_handlers =>
+			{
+			 Track => \&track_handler,
+			 Trackpoint => \&trackpt_handler
+			}
+		       );
+
+# restore from file or parse xml
+if($opt{retrieve}) {
+     @TRACKS = @{ retrieve($opt{retrieve}) };
+     $ntracks = scalar (@TRACKS);
+     print "Total Tracks = $ntracks\n" if $opt{verbose};
+
+     if(1 < $opt{verbose}) {
+	  for my $i (0 .. $ntracks - 1){
+	       dumptrack($i, 1);
+	  }
+     }
+}
+else {
+     pod2usage(1) unless $opt{file};
+     # parse xml file
+     $twig->parsefile($opt{file});
+     print "found $ntracks in $opt{file}\n" if $opt{verbose};
+
+     if ($opt{split} && ($ntracks > 1)) {
+	  # create trackdir if it does not exist yet
+	  unless(-d $opt{trackdir}){
+	       mkdir $opt{trackdir} or die "Could not create $opt{trackdir}: $!";
+	  }
+
+	  print "split into single tracks\n" if $opt{verbose};
+	  for my $i (0 .. $ntracks - 1){
+	       my $start = $TRACKS[$i]->{start};
+	       my $stop  = $TRACKS[$i]->{stop};
+	       my $base_file = basename($opt{file});
+	       my $outfile = "/tmp/$base_file.$start";
+	       my $gpxfile = "$opt{trackdir}/$base_file.$start.gpx";
+	       my $kmlfile = "$opt{trackdir}/$base_file.$start.kml";
+
+	       print "$start/$stop $outfile\n" if (1 < $opt{verbose});
+	       my $rc = system("$gpsbabel -i gtrnctr -f $opt{file} " .
+			       "-x track,start=$start,stop=$stop " .
+			       "-o gtrnctr -F $outfile");
+	       die "Error: gpsbabel failed rc=$rc, stopped" unless ($rc == 0);
+
+	       # generate unique message digest for this file
+	       my $digest = gen_track_digest($outfile);
+	       $TRACKS[$i]->{hash} = $digest;
+
+	       # compare hash value of this tracks against known tracks
+	       if (! have_track_file($digest) && $opt{'store-file'}) {
+		    store_track_file($outfile, $i);
+	       }
+	       if (! have_track_db($digest) && $opt{'store-database'}) {
+		    store_track_db($outfile, $i);
+
+		    #FIXME
+		    if ($opt{'export'}) {
+			 print "copy database ... " if $opt{verbose};
+			 my $rc = system("tracks-backup.sh");
+			 die "Error: Failed rc=$rc, stopped" unless ($rc == 0);
+			 print "OK\n" if $opt{verbose};
+		    }
+
+	       }
+
+
+	       # parse/simplify kml file ... get only coordinates
+	       # store lat/long in database in order to search for tracks close
+	       # to some specific point (e.g. get that point via google maps api)
+
+	  }
+
+     }
+
+}
+
+# check if track is in digest file
+sub have_track_file {
+     my $hash =  $_[0];
+     my $digests_file = "$opt{trackdir}/digests";
+     my $matches;
+
+     # check if track is in tracks directory
+     if (! open(FILE, "<$digests_file")) {
+	  warn "Could not open $digests_file: $!";
+	  return 0;
+     }
+     my(@digests) = <FILE>;
+     close(FILE);
+     $matches = grep /$hash/, @digests;
+     if ($matches >= 1) {
+	  warn "More than one match in digest file!" if ($matches > 1);
+	  print "have_track_file matches: $hash\n" if (2 < $opt{verbose});
+	  return $matches;
+     }
+     return 0;
+}
+# check if track is in database
+sub have_track_db {
+     my $hash =  $_[0];
+     my $digests_file = "$opt{trackdir}/digests";
+     my $matches;
+
+     # check if track is in tracks database
+     $matches = $dbh->selectrow_array("SELECT * FROM tracks WHERE (hash = \"$hash\")");
+     if (defined $matches) {
+	  print "have_track_db matches: $hash\n" if (2 < $opt{verbose});
+	  return 1;
+     }
+     return 0;
+}
+
+sub store_track_file {
+     my $file  = $_[0];
+     my $track = $_[1];
+     my $dest  = "$opt{trackdir}/" . basename($file);
+     my $digests_file = "$opt{trackdir}/digests";
+     my $hashfile = "$file.sha1";
+     my $gpxfile = "$dest.gpx";
+     my $kmlfile = "$dest.kml";
+
+     print "copy $file to $dest [track=$track]\n" if $opt{verbose};
+     copy($file, $dest) or die "Error copying $file: $!";
+
+     # update digests file
+     open(FILE, ">>$digests_file") or die "Error opening $digests_file: $!";
+     open(HASH, "<$hashfile") or die "Error opening $hashfile";
+     my $hash = <HASH>;
+     print FILE $hash;
+     close(HASH);
+     close(FILE);
+
+     write_gpx($file, $gpxfile, $track);
+     write_kml($file, $kmlfile, $track);
+
+     if ($opt{'export'}) {
+	  print "scp $dest, $gpxfile and $kmlfile to $opt{'remote-host'}:$opt{'remote-dir'}\n"
+	       if $opt{verbose};
+	  my $rc = system("scp $dest $gpxfile $kmlfile " . $opt{'remote-user'} .
+			   '@' . $opt{'remote-host'} . ':' . $opt{'remote-dir'});
+	  die "Error: scp failed rc=$rc, stopped" unless ($rc == 0);
+     }
+}
+
+sub store_track_db {
+     my $file  = $_[0];
+     my $track = $_[1];
+     my $dest  = "$opt{trackdir}/" . basename($file);
+     my $gpxfile = "$dest.gpx";
+     my $kmlfile = "$dest.kml";
+
+
+     print "store at database:\n";
+     print basename($file) . "\n";
+     print $TRACKS[$track]->{start}, "\n";
+     print $TRACKS[$track]->{stop}, "\n";
+     print $TRACKS[$track]->{distance}, "\n";
+     print $TRACKS[$track]->{time_total_hms}, "\n";
+     print $TRACKS[$track]->{avg_heartrate}, "\n";
+     print $TRACKS[$track]->{avg_pace}, "\n";
+     print $TRACKS[$track]->{min_alt}, "\n";
+     print $TRACKS[$track]->{max_alt}, "\n";
+     print $TRACKS[$track]->{trackpoints}, "\n";
+
+     my $insert = sprintf("INSERT INTO tracks (hash, startdate, enddate, filename, trackpoints, distance, time, pace, altmin, altmax, hravg) " .
+			  "VALUES (%s, %d, %d, %s, %d, %f, %d, %d, %d, %d, %d)",
+			  $dbh->quote($TRACKS[$track]->{hash}),
+			  $TRACKS[$track]->{start},
+			  $TRACKS[$track]->{stop},
+			  $dbh->quote(basename($file)),
+			  $TRACKS[$track]->{trackpoints},
+			  $TRACKS[$track]->{distance},
+			  $TRACKS[$track]->{time_total_hms},
+			  $TRACKS[$track]->{avg_pace},
+			  $TRACKS[$track]->{min_alt},
+			  $TRACKS[$track]->{max_alt},
+			  $TRACKS[$track]->{avg_heartrate},
+			  );
+     print "MySQL insert: $insert\n";
+     $dbh->do($insert);
+
+}
+# xxx simplify options -> relative/hdop ?
+sub write_gpx {
+     my $file    = $_[0];
+     my $gpxfile = $_[1];
+     my $track   = $_[2];
+
+     print "write track $track to gpx file $gpxfile\n" if $opt{verbose};
+     my $rc = system("$gpsbabel -i gtrnctr -f $file " .
+		     "-x simplify,count=2000 " .
+		     "-o gpx -F $gpxfile");
+     die "Error: gpsbabel failed rc=$rc, stopped" unless ($rc == 0);
+}
+
+sub write_kml {
+     my $file    = $_[0];
+     my $kmlfile = $_[1];
+     my $track   = $_[2];
+     my $coordinates = "";
+     my %vars;
+
+# gpsbabel kml from trainigs center format does not give desired output (yet?)
+#     my $rc = system("$gpsbabel -i gtrnctr -f $file " .
+#		     "-x simplify,relative,count=2000 " .
+#		     "-o kml -F $kmlfile");
+#     die "Error: gpsbabel failed rc=$rc, stopped" unless ($rc == 0);
+     print "write track $track to kml file $kmlfile\n" if $opt{verbose};
+
+     # loop over track points
+     foreach (@{$TRACKS[$track]->{points}}) {
+	  $coordinates = sprintf("%s          %s,%s,%s\n", $coordinates,
+				 $_->{longitude},
+				 $_->{latitude},
+				 $_->{altitude});
+     }
+     $vars{NAME} = $TRACKS[$track]->{start};
+     $vars{COORDINATES} = $coordinates;
+
+     # replace placeholders in the template file
+     my $tmp = read_template($opt{'kml-template'});
+     $tmp =~ s/\$([A-Z_]+)\$/$vars{$1}/gs;
+
+     # save the kml file
+     open(KML, ">$kmlfile") or die "Error opening $kmlfile: $!";
+     print KML $tmp;
+     close(KML);
+}
+sub read_template {
+     my $file = $_[0];
+     my $temp;
+
+     open(FOO, "<$file") or die "Error opening $file; $!";
+     local $/ = undef;
+     $temp = <FOO>;
+     close FOO;
+     return $temp;
+}
+
+
+# save TRACKS
+if($opt{store}){
+     nstore(\@TRACKS, $opt{store});
+}
+
+# dump and/or draw track(s)
+if($opt{dump}){
+     foreach (@{$opt{dump}}) {
+	  dumptrack($_, 2);
+     }
+}
+if($opt{graph}){
+     foreach (@{$opt{graph}}) {
+	  next unless ($_ < $ntracks);
+	  draw_diagram($_, $opt{type}); # actually %opt is global
+     }
+}
+
+
+
+
+###############################################################################
+###############################################################################
+
+# handlers ... note trackpt_handler called BEFORE track_handler !
+sub track_handler {
+     my ($t, $track) = @_;
+
+     print "\nTrack $ntracks\n" if $opt{verbose};
+     my $dist		= calc_dist($ntracks);
+     my $alt_diff	= calc_alt_diff($ntracks);
+     my $avg_hr		= calc_avg_heartrate($ntracks);
+
+
+     # add data to this track
+     $TRACKS[$ntracks]->{distance}   = $dist;
+     $TRACKS[$ntracks]->{altdiff}    = $alt_diff;
+     $TRACKS[$ntracks]->{time_start} = $TRACKS[$ntracks]->{points}->[0]->{time};
+     $TRACKS[$ntracks]->{time_end}   = $TRACKS[$ntracks]->{points}->[-1]->{time};
+     $TRACKS[$ntracks]->{zulu_start} = $TRACKS[$ntracks]->{points}->[0]->{zulu};
+     $TRACKS[$ntracks]->{start}      = zulu2str($TRACKS[$ntracks]->{points}->[0]->{zulu});
+     $TRACKS[$ntracks]->{stop}       = zulu2str($TRACKS[$ntracks]->{points}->[-1]->{zulu});
+     $TRACKS[$ntracks]->{time_total} = $TRACKS[$ntracks]->{time_end} -
+	  $TRACKS[$ntracks]->{time_start};
+     $TRACKS[$ntracks]->{time_total_hms} = s2hms($TRACKS[$ntracks]->{time_total});
+     $TRACKS[$ntracks]->{trackpoints}    = $trackpoints;
+     $TRACKS[$ntracks]->{avg_heartrate}  = $avg_hr;
+     $TRACKS[$ntracks]->{avg_pace}       = calc_avg_pace($ntracks);
+
+     dumptrack($ntracks, $opt{verbose}) if $opt{verbose};
+     print "End of Track $ntracks\n" if $opt{verbose};
+
+     $last_trackpt = undef;	#
+     $trackpoints = 0;		# reset track points
+     $ntracks++;		# increase track counter
+     $t->purge();		# free this track
+}
+
+sub trackpt_handler {
+     my ($t, $trackpt) = @_;
+
+     my $zulutime = $trackpt->first_child_text('Time');
+     my $time = str2time($zulutime);
+     my $altitude = $trackpt->first_child_text('AltitudeMeters');
+     my $heartrate = $trackpt->first_child_text('HeartRateBpm') ?
+	  $trackpt->first_child_text('HeartRateBpm') : 0; # XXX V2: <value></value>
+     my $pos = $trackpt->first_child('Position');
+     my $lat = $pos->first_child_text('LatitudeDegrees');
+     my $lon = $pos->first_child_text('LongitudeDegrees');
+
+     my $dist  = 0;
+     my $pace  = 0;
+     my $speed = 0;
+     my $dtime = 0;
+     # set dist, pace, speed for each track point
+     # $var_ is value from last trackpoint
+     # $var is current trackpoint value
+     if ($last_trackpt){
+	  my $pos_ = $last_trackpt->first_child('Position');
+	  my $lat_ = $pos_->first_child_text('LatitudeDegrees');
+	  my $lon_ = $pos_->first_child_text('LongitudeDegrees');
+	  my $time_ = str2time($last_trackpt->first_child_text('Time'));
+	  $dtime = $time - $time_;
+	  $dist = calc_ddist($lon_, $lat_, $lon, $lat);
+	  $speed = calc_speed($dist, $dtime);
+	  $pace = calc_pace($dist, $dtime);
+     }
+     $last_trackpt = $trackpt;
+
+     printf("(%d): t:%d(+%d); alt:%d; hr:%d; lat:%f; lon:%f; d:%.4f; s:%.2f; p:%s\n",
+	    $ntracks, $time, $dtime, $altitude, $heartrate, $lat, $lon, $dist,
+	    $speed, $pace)
+	  if (3 < $opt{verbose});
+
+
+     push @{$TRACKS[$ntracks]->{points}}, {
+					   time => $time,
+					   dtime => $dtime,
+					   zulu => $zulutime,
+					   altitude => $altitude,
+					   heartrate => $heartrate,
+					   latitude => $lat,
+					   longitude => $lon,
+					   dist => $dist,
+					   speed => $speed,
+					   pace => $pace,
+					  };
+
+
+     $trackpoints++;	# increment trackpoint counter for this track
+}
+
+# delta between two points
+sub calc_ddist {
+     my @pos = @_;
+
+     return $geo->distance('kilometer', @pos);
+}
+
+# calc speed (km/h)
+sub calc_speed {
+     my $d = shift; # km
+     my $t = shift; # sec
+
+     return ($d / ($t / (60 * 60))); # km/h
+}
+
+# calc pace (min:sec/km), returns formatted string
+sub calc_pace {
+     my $d = shift; # km
+     my $t = shift; # sec
+
+     return if not ($d && $t);
+
+     my $tm = ($t / $d) / 60;
+     my $ts = ($t / $d) % 60;
+     return sprintf("%.2d:%.2d", $tm, $ts);
+}
+
+# calculate total track distance
+sub calc_dist {
+     my $n = shift;
+
+     my $total = 0;
+     my $last;
+
+     foreach (@{$TRACKS[$n]->{points}}) {
+	  if ($last) {
+	       my $d = $geo->distance('kilometer',
+				      $last->{longitude}, $last->{latitude} =>
+				      $_->{longitude}, $_->{latitude});
+	       $total += $d;
+	  }
+	  $last = $_;
+     }
+     return $total;
+}
+
+# calculate average heartrate for a given track
+# will be 0 if heartrate wasn't monitored during this track
+sub calc_avg_heartrate {
+     my $n = shift;
+
+     my $last;
+     my $avg;
+     my $hr  = 0;
+     my $min = $TRACKS[$n]->{points}[0]->{heartrate};
+     my $max = $TRACKS[$n]->{points}[0]->{heartrate};
+
+     foreach (@{$TRACKS[$n]->{points}}) {
+	  if ($last) {
+	       if ($min > $_->{heartrate}) {
+		    $min = $_->{heartrate};
+	       }
+	       if ($max < $_->{heartrate}) {
+		    $max = $_->{heartrate};
+	       }
+	  }
+	  $last = $_;
+	  $hr += $_->{heartrate};
+     }
+     # save min and max heartrate in main TRACKS array
+     $TRACKS[$n]->{min_hr} = $min;
+     $TRACKS[$n]->{max_hr} = $max;
+     $avg = $hr / $trackpoints;
+
+     print "min hr: $min; max hr: $max; avg hr: $avg\n" if (1 < $opt{verbose});
+     return sprintf("%.0f", $avg);
+}
+
+sub calc_avg_pace {
+     my $n = shift;
+
+     my $speed = $TRACKS[$ntracks]->{distance} / $TRACKS[$n]->{time_total};
+     sec2pace(1/$speed);
+}
+
+# FIXME: get total ascending and total descending
+# FIXME: interpolate (smooth) the given altitudes for each point
+# XXX ?: compare and adjust each given height for a point against values from eg. http://www.earthtools.org/
+
+# calculate altitude difference
+# currently this is only  ALTmax - ALTmin
+# usually for a give track the altitude difference is the sum
+# of all distances (in meters)  you run upwards. sometimes this also
+# includes the distances running downwards (e.g. +/-300m)
+sub calc_alt_diff {
+     my $n = shift;
+
+     my $min  = $TRACKS[$n]->{points}[0]->{altitude};
+     my $max  = $TRACKS[$n]->{points}[0]->{altitude};
+     my $last;
+
+     foreach (@{$TRACKS[$n]->{points}}) {
+	  if ($last) {
+	       if ($min > $_->{altitude}) {
+		    $min = $_->{altitude};
+	       }
+	       if ($max < $_->{altitude}) {
+		    $max = $_->{altitude};
+	       }
+	  }
+	  $last = $_;
+     }
+     # save min and max altitude in main TRACKS array
+     $TRACKS[$n]->{min_alt} = $min;
+     $TRACKS[$n]->{max_alt} = $max;
+
+     print "min alt: $min; max alt: $max\n" if (1 < $opt{verbose});
+     return ($max - $min);
+}
+# alternate calculation using sort, but this seems slower
+sub calc_alt_diff_2 {
+     my $n = shift;
+
+     my @alts = sort { $a->{altitude} <=> $b->{altitude} }
+	  @{$TRACKS[$n]->{points}};
+     return ($alts[-1]->{altitude} - $alts[0]->{altitude});
+}
+
+# convert 2008-12-04T10:38:58Z into 20081204103858
+sub zulu2str {
+     my $t = $_[0];
+
+     if ($t =~ m/^(\d\d\d\d)-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)Z$/) {
+	  return sprintf("%.4d%.2d%.2d%.2d%.2d%.2d", $1, $2, $3, $4, $5, $6);
+     }
+     return -1;
+}
+
+# seconds to 'hh:mm:ss' format
+sub s2hms {
+     my $t = shift;
+
+     my $sec = $t % 60;
+     my $tmin = $t / 60;
+     my $min = $tmin % 60;
+     my $hour = $tmin / 60;
+     return sprintf("%.2d%.2d%.2d", $hour, $min, $sec);
+}
+
+sub pace2sec {
+     my ($m, $s);
+     if ($_[0] =~ m/(\d\d):(\d\d)/){
+	  $m = $1;
+	  $s = $2;
+	  $s = defined $s ? $s : 0;
+	  return $m * 60 + $s;
+     }
+     warn("WARNING: pace2sec: invalid pace=$_[0]");
+}
+
+sub sec2pace {
+     my $hms = s2hms($_[0]);
+
+     if ($hms =~ m/(\d\d)(\d\d)(\d\d)/){
+	  return sprintf("%.2d%.2d", $2, $3);
+     }
+     warn("WARNING: sec2pace: invalid hms=$hms");
+}
+
+## FIXME: pace diagram broken
+# draw altitude profile and store as (png) image file
+# type might be elevation, heartrate, pace
+sub draw_diagram {
+     my $n = shift;
+     my $type = shift;
+
+     use GD::Graph::mixed;
+     use GD::Graph::linespoints;
+     use GD::Graph::area;
+     use GD::Graph::colour;
+
+     print "drawing $type diagram for track $n\n" if $opt{verbose};
+
+     #my $graph = GD::Graph::linespoints->new(400, 300);
+     my $graph = GD::Graph::area->new(1024, 768);
+
+
+     my $start = $TRACKS[$n]->{time_start};
+     my $end = $TRACKS[$n]->{time_end};
+     my $altoff = sprintf("%.0f", $TRACKS[$n]->{min_alt});
+
+     my (%labels) = (
+		     elevation =>
+		     {
+		      'y' => "Elevation (m) (Offset $altoff m)",
+		      'ymax' => sprintf("%.0f", $TRACKS[$n]->{altdiff}),
+		     },
+		     heartrate =>
+		     {
+		      'y' => 'Heartrate (bpm)',
+		      'ymax' => $TRACKS[$n]->{max_hr}
+		     },
+		     pace =>
+		     {
+		      'y' => 'Pace (sec)',
+		      'ymax' => pace2sec($TRACKS[$n]->{avg_pace}) + 180
+		     }
+		    );
+
+     # fill data array, get x and y values
+     my @x  = (); # time and distance
+     my @data ;   # data array passed to graph->plot()
+     my @y1 = (); # elevation
+     my @y2 = (); # distance
+     my @y3 = (); # heartrate
+     my @y4 = (); # pace
+     my $last;
+     my $total = 0;
+     foreach (@{$TRACKS[$n]->{points}}) {
+	  # elevation
+	  push @y1, nice_a($_->{altitude} - $altoff);
+	  # distance between points
+	  if ($last) {
+	       my $d = $geo->distance('kilometer',
+				      $last->{longitude}, $last->{latitude} =>
+				      $_->{longitude}, $_->{latitude});
+	       $total += $d;
+	  }
+	  push @y2, nice_km($total);
+	  # heartrate
+	  push @y3, $_->{'heartrate'};
+	  # pace
+	  push @y4, pace2sec($_->{'pace'});
+	  # x-axis time/accumulated distance
+	  push @x,  nice_t($_->{zulu}) . ", " . nice_km($total);
+	  $last = $_;
+     }
+     # perl switch ... fill data array based on type
+     for ($type) {
+	  if (/heartrate/)	{
+	       @data = (\@x, \@y3);
+	  }
+	  elsif (/pace/)	{
+	       @data = (\@x, \@y4);
+	  }
+	  else { # default, elevation
+	       @data = (\@x, \@y1);
+	  }
+     }
+     print "y_offset: ", $labels{$type}->{'y'},   "\n" if (1 < $opt{verbose});
+     print "y_max:    ", $labels{$type}->{'ymax'},"\n" if (1 < $opt{verbose});
+     print "data:@data\nx:@x\ny1:@y1\ny2:@y2\ny3:@y3\ny4:@y4\n" if (2 < $opt{verbose});
+
+     my $title = sprintf("Forerunner 305 - Track %d - %.1f km - %s",
+			 $n, $TRACKS[$n]->{distance}, $TRACKS[$n]->{time_total_hms});
+     $graph->set(
+		 'x_label'	 => 'Time, Distance (km)',
+		 'x_labels_vertical'=> 1,
+		 'y_label'	 => $labels{$type}->{'y'},
+		 'title'	 => $title,
+		 'y_max_value'	 => $labels{$type}->{'ymax'},
+#		 'y_tick_number' => 5,
+#		 'y_label_skip'  => 1,
+		 'long_ticks' => 1,
+		 'x_label_skip'  => 60,
+		 'transparent'	 => 0,
+		 'bgclr'	 => 'white',
+		) or die $graph->error;
+
+     my $gd = $graph->plot(\@data) or die $graph->error;
+
+     open(IMG, ">track.$n.$type.png") or die $!;
+     binmode IMG;
+     print IMG $gd->png;
+
+}
+sub nice_t {
+     my $x = shift;
+     $x =~ m/\d\d\d\d-\d\d-\d\dT(\d\d:\d\d):\d\dZ/;
+     return $1;
+}
+sub nice_a {
+     my $x   = shift;
+     return sprintf("%.0f", $x);
+}
+sub nice_km {
+     my $x = shift;
+     return sprintf("%.1f", $x);
+}
+
+# dump a track
+# per default print all track details
+# if level greater 1 then also print all points per track
+sub dumptrack {
+     my $n = shift;
+     my $level = shift;
+
+     print "\nTrack $n\n" if $opt{retrieve};
+     printf("zulu start time     = %s\n",   $TRACKS[$n]->{zulu_start});
+     printf("start time          = %s\n",   $TRACKS[$n]->{start});
+     printf("stop  time          = %s\n",   $TRACKS[$n]->{stop});
+     printf("distance            = %.3f\n", $TRACKS[$n]->{distance});
+     printf("altitude difference = %.0f\n", $TRACKS[$n]->{altdiff});
+     printf("total time          = %s\n",   $TRACKS[$n]->{time_total_hms});
+     printf("total trackpoints   = %d\n",   $TRACKS[$n]->{trackpoints});
+     printf("avg. heartrate      = %d\n", $TRACKS[$n]->{avg_heartrate});
+     printf("avg. pace           = %s\n", $TRACKS[$n]->{avg_pace});
+
+     if(4 < $level){
+	  print "Track $n points:\n";
+	  print "time;altitude;heartrate;latitude;longitude;dist;speed;pace\n";
+	  foreach (@{$TRACKS[$n]->{points}}) {
+	       printf("%s;%s;%s;%s;%s;%s;%s;%s\n", $_->{time}, $_->{altitude},
+		      $_->{heartrate}, $_->{latitude}, $_->{longitude},
+		      $_->{dist}, $_->{speed}, $_->{pace});
+	  }
+     }
+     print "End of Track $n:\n" if $opt{retrieve};
+}
+
+
+# generate sha1 message digest from single track file
+# store the hash value in a file
+sub gen_track_digest {
+     my $file = $_[0];
+     my $hashfile = "$file.sha1";
+
+     open(HASH, ">$hashfile") or die "Error opening $hashfile: $!";
+     my $sha = Digest::SHA->new('sha1_hex');
+     $sha->addfile($file);
+     my $digest = $sha->hexdigest;
+     print "$digest\n" if (2 < $opt{verbose});
+     print HASH $digest, " ", basename($file), "\n";
+     close(HASH);
+     return $digest;
+}
+
+
+
+sub parse_commandline {
+    my $result = GetOptions(
+			    "help|h"		=> \$opt{help},
+			    "man"		=> \$opt{man},
+			    "verbose|v+"	=> \$opt{verbose},
+			    "version|V"		=> sub { print VERSION . "\n"; exit 0; },
+			    "file|f=s"		=> \$opt{file},
+			    "store|s=s"		=> \$opt{store},
+			    "retrieve|r=s"	=> \$opt{retrieve},
+			    "type|t=s"		=> \$opt{type},
+			    "dump|d=s@"		=> \$opt{dump},
+			    "graph|g=s@"	=> \$opt{graph},
+			    "trackname=s"	=> \$opt{trackname},
+			    "split|S"		=> \$opt{split},
+			    "trackdir|T=s"	=> \$opt{trackdir},
+			    "htmltrack"		=> \$opt{htmltrack},
+			    "html-template=s"	=> \$opt{'html-template'},
+			    "kml-template=s"	=> \$opt{'kml-template'},
+			    "database-host=s"	=> \$opt{'database-host'},
+			    "database-name=s"	=> \$opt{'database-name'},
+			    "export-tracks|e"	=> \$opt{'export'},
+			    "remote-host=s"	=> \$opt{'remote-host'},
+			    "remote-user=s"	=> \$opt{'remote-user'},
+			    "remote-dir=s"	=> \$opt{'remote-dir'},
+			    "create-route|R"	=> \$opt{'route'},
+			    "store-file"	=> \$opt{'store-file'},
+			    "store-database"	=> \$opt{'store-database'}
+			   ) or pod2usage(2);
+    pod2usage(1) if defined ($opt{help});
+    pod2usage(-verbose => 2) if defined ($opt{man});
+}
+
+
+
+__END__
+
+
+
+
+=head1 NAME
+
+foretrain
+
+=head1 SYNOPSIS
+
+foretrain [OPTIONS ...]
+
+    OPTION
+
+        [--help] [--version,-V] [--verbose,-v [--verbose ...]] [--man]
+        [--file,-f XML_FILE] [--store,-s FILE] [--retrieve,-r FILE]
+	[--dump TRACK_NO] [--graph,-g TRACK_NO] [--type,-t TYPE]
+	[--trackname NAME] [--split,-S] [--trackdir,-T]
+	[--kml-template FILE] [--kml-template FILE]
+	[--database-host HOSTNAME] [--database-name NAME]
+	[--store-file] [--store-database] [--export-tracks,-e]
+	[--remote-user USER] [--remote-host HOST] [--remote-host DIR]
+
+
+=head1 ABSTRACT
+
+Parse an Garmin Trainings Center XML file that was generated by gpsbabel.
+
+=head2 Details
+
+This script was created to parse a Garmin Traings Center XML file. The file
+needs to be generated using the open source tool gpsbabel.
+The commandline to generate such a file looks like this:
+$ gpsbabel -p "" -r -t -w -i garmin -f usb: -o gtrnctr -F garmin.tc.xml
+Please refer to gpsbabel documentation for usage and option information.
+
+=head1 OPTIONS
+
+=over
+
+=item B<--help>
+
+	Print out brief help message.
+
+=item B<--man>
+
+	Print manual page, same as 'perldoc ryanair'
+
+=item B<--verbose>
+
+	Print out useful information about what's going on.
+	Multiple -v options increase verbosity level.
+
+=item B<--file XML_FILE>
+
+	Use XML_FILE as input file.
+
+=item B<--store FILE>
+
+	Store the TRACKS structure into a FILE from where it can
+	be retrieved later on.
+
+=item B<--retrieve FILE>
+
+	Retrieve the tracks from a FILE. This option and --file
+	are exclusive.
+
+=item B<--dump TRACK_NO>
+
+	Dump details about this track. Multiple --dump options
+	are allowed.
+
+=item B<--graph TRACK_NO>
+
+	Generate a .png image file containing track information.
+	Per default the graph shows the elevation over time/km.
+	Use the --type argument to change the graph type.
+
+=item B<--type GRAPH_TYPE>
+
+	Set the graph type. Currently possible values are:
+	elevation (DEFAULT), heartrate, pace.
+
+=item B<--split,-S>
+
+	Split trainings center XML file into single tracks and store
+	them in TRACKDIR and/or MySQL databse.
+
+=item B<--trackdir,-T DIR>
+
+	Directory where we store the single tracks that are extracted if
+	using the split option above.
+	Default trackdir is '/var/www/tracks/'.
+
+=item B<--store-file>
+
+	If you are using the split option (see above) you need to give this
+	option as well to actually store the single files into the trackdir.
+
+=item B<--store-database>
+
+	Likewise if used with the split option this option will actually store
+	the track information into an MySQL database.
+
+=item B<--export-tracks,-e>
+
+	Export track files and database to remote site (webserver).
+	NOTE: the path to the script for database backup is hardcoded.
+	The files are copied via scp (assuming ssh keys are stored on server).
+
+
+
+=back
+
+=head1 BUGS
+
+Send reports to andy@exitzero.de
+
+Cannot handle history files from garmin trainings center yet.
+Those include activities (running,cycling,..) this is not in the
+gpsbabel output file.
+
+
+=head1 SEE ALSO
+
+	gpsbabel:		http://www.gpsbabel.org
+	garmin forerunner:	https://buy.garmin.com/shop/shop.do?cID=142&pID=349
+	garmin interface sdk:	http://www8.garmin.com/support/commProtocol.html
+	Michael Schilli:	http://linux-magazin.de/heft_abo/ausgaben/2006/07/hinterm_horizont/(kategorie)/0
+
+=head1 AUTHOR
+
+Andreas Loeffler <andy@exitzero.de>
+
+=cut
+
+
