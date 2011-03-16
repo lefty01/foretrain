@@ -2,7 +2,7 @@
 
 
 # foretrain: parse gpsbabel (-o gtrnctr) generated garmin xml files.
-# Copyright (c) Andreas Loeffler <andy@exitzero.de>, 2008,2009,2010
+# Copyright (c) Andreas Loeffler <andy@exitzero.de>, 2007,2008,2009,2011
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License as
@@ -33,11 +33,13 @@ use Date::Parse;
 use Geo::Distance;
 use Digest::SHA;
 use DBI;
+use Sys::AlarmCall;
 
 
 use constant {
-     VERSION => "foretrain version 0.7",	# program version
-     BABELVERSION => "1.3.6",			# min. required gpsbabel version
+     REVISION => "\$revision \$",		# cvs revision
+     VERSION => "foretrain version 1.3",	# program version
+     BABELVERSION => "1.4.0",			# required gpsbabel version
 };
 
 
@@ -54,6 +56,8 @@ my @TRACKS;
 my @POINTS;
 my $last_trackpt = undef;
 
+my $db_user = 'xxx';
+my $db_pass = 'xxx';
 
 ################################## start ######################################
 parse_commandline();
@@ -66,7 +70,7 @@ $opt{'database-host'} = 'localhost' unless defined $opt{'database-host'};
 $opt{'database-name'} = 'xxxxxx' unless defined $opt{'database-name'};
 $opt{'remote-host'} = 'exitzero.de' unless defined $opt{'remote-dir'};
 $opt{'remote-user'} = 'user' unless defined $opt{'remote-user'};
-$opt{'remote-dir'} = '/xxx/xxxxxxxxxxxx/xxx/xxxx' unless defined $opt{'remote-dir'};
+$opt{'remote-dir'} = '/tracks' unless defined $opt{'remote-dir'};
 
 # printout cmdline options if verbose
 if($opt{verbose}){
@@ -78,7 +82,7 @@ if($opt{verbose}){
 
 # Connect to the database.
 my $dbh = DBI->connect("DBI:mysql:database=$opt{'database-name'};host=$opt{'database-host'}",
-		       "xxxxxx", "xxxxxx",
+		       $db_user, $db_pass,
 		       {'RaiseError' => 1});
 
 # alloc geo object to calc track distance
@@ -111,7 +115,7 @@ else {
      $twig->parsefile($opt{file});
      print "found $ntracks in $opt{file}\n" if $opt{verbose};
 
-     if ($opt{split} && ($ntracks > 1)) {
+     if (($opt{extract} || $opt{split}) && ($ntracks > 0)) {
 	  # create trackdir if it does not exist yet
 	  unless(-d $opt{trackdir}){
 	       mkdir $opt{trackdir} or die "Could not create $opt{trackdir}: $!";
@@ -123,8 +127,8 @@ else {
 	       my $stop  = $TRACKS[$i]->{stop};
 	       my $base_file = basename($opt{file});
 	       my $outfile = "/tmp/$base_file.$start";
-	       my $gpxfile = "$opt{trackdir}/$base_file.$start.gpx";
-	       my $kmlfile = "$opt{trackdir}/$base_file.$start.kml";
+	       my $gpxfile = "/tmp/$base_file.$start.gpx";
+	       my $kmlfile = "/tmp/$base_file.$start.kml";
 
 	       print "$start/$stop $outfile\n" if (1 < $opt{verbose});
 	       my $rc = system("$gpsbabel -i gtrnctr -f $opt{file} " .
@@ -136,17 +140,25 @@ else {
 	       my $digest = gen_track_digest($outfile);
 	       $TRACKS[$i]->{hash} = $digest;
 
+	       # if we only want to extract a single track as kml/gpx
+	       if ($opt{extract} && $opt{extract} == $i) {
+		    print "extracting track no $opt{extract} from  $opt{file}"
+			 if $opt{verbose};
+		    write_gpx($outfile, $gpxfile, $i);
+		    write_kml($outfile, $kmlfile, $i);
+		    exit 0;
+	       }
+
 	       # compare hash value of this tracks against known tracks
 	       if (! have_track_file($digest) && $opt{'store-file'}) {
 		    store_track_file($outfile, $i);
 	       }
-	       if (! have_track_db($digest) && $opt{'store-database'}) {
+	       if ((! have_track_db($digest) && $opt{'store-database'}) || $opt{debug}) {
 		    store_track_db($outfile, $i);
 
-		    #FIXME
 		    if ($opt{'export'}) {
 			 print "copy database ... " if $opt{verbose};
-			 my $rc = system("tracks-backup.sh");
+			 my $rc = system("/usr/local/bin/tracks-backup.sh");
 			 die "Error: Failed rc=$rc, stopped" unless ($rc == 0);
 			 print "OK\n" if $opt{verbose};
 		    }
@@ -164,6 +176,13 @@ else {
 
 }
 
+# helper to get key press input from user
+sub getkey {
+     system "stty", '-icanon', 'eol', "\001";
+     ${$_[0]} = getc(STDIN);
+     system "stty", 'icanon', 'eol', '^@'; # ASCII null
+}
+
 # check if track is in digest file
 sub have_track_file {
      my $hash =  $_[0];
@@ -172,7 +191,7 @@ sub have_track_file {
 
      # check if track is in tracks directory
      if (! open(FILE, "<$digests_file")) {
-	  warn "Could not open $digests_file: $!";
+	  warn "Warning: Could not open $digests_file: $!";
 	  return 0;
      }
      my(@digests) = <FILE>;
@@ -192,7 +211,7 @@ sub have_track_db {
      my $matches;
 
      # check if track is in tracks database
-     $matches = $dbh->selectrow_array("SELECT * FROM tracks WHERE (hash = \"$hash\")");
+     $matches = $dbh->selectrow_array("SELECT * FROM $opt{'database-name'} WHERE (hash = \"$hash\")");
      if (defined $matches) {
 	  print "have_track_db matches: $hash\n" if (2 < $opt{verbose});
 	  return 1;
@@ -250,26 +269,93 @@ sub store_track_db {
      print $TRACKS[$track]->{avg_pace}, "\n";
      print $TRACKS[$track]->{min_alt}, "\n";
      print $TRACKS[$track]->{max_alt}, "\n";
+     print $TRACKS[$track]->{latmin}, "\n";
+     print $TRACKS[$track]->{latmax}, "\n";
+     print $TRACKS[$track]->{lngmin}, "\n";
+     print $TRACKS[$track]->{lngmax}, "\n";
      print $TRACKS[$track]->{trackpoints}, "\n";
 
-     my $insert = sprintf("INSERT INTO tracks (hash, startdate, enddate, filename, trackpoints, distance, time, pace, altmin, altmax, hravg) " .
-			  "VALUES (%s, %d, %d, %s, %d, %f, %d, %d, %d, %d, %d)",
+
+     # allow user to enter tags/description for this track
+     my $ans;
+     my $name = ""; # max 255
+     my $tags = ""; # max 255
+     my $desc = ""; # max 2048
+     goto INPUTOK if $opt{'no-description'};
+     dumptrack($track, $opt{verbose});
+     print "Press any key to enter name, tags, and description for this track.\n";
+     print "(will continue in 30sec - press ESC to skip): ";
+
+     alarm_call(30, 'getkey', \$ans);
+     if (defined $ans && $ans ne "\e") {
+	AGAIN:
+	  print "Enter name: ";
+	  chomp($name = <STDIN>);
+
+	  print "Enter tags: ";
+	  chomp($tags = <STDIN>);
+
+	  print "Please enter a track description: ";
+	  chomp($desc = <STDIN>);
+
+	  print "Name: $name\n";
+	  print "Tags: $tags\n";
+	  print "Description: $desc\n";
+	  print "OK? Y(yes), N(no, again) or S(skip): ";
+	  chomp($ans = <STDIN>);
+	  if ($ans =~ m/^y/i) {
+	       goto INPUTOK;
+	  } elsif ($ans =~ m/^s/i) {
+	       $name = "";
+	       $tags = "";
+	       $desc = "";
+	       goto INPUTOK;
+	  }
+	  goto AGAIN;
+     }
+   INPUTOK:
+     print "name: $name\n"	  if $opt{verbose};
+     print "tags: $tags\n"	  if $opt{verbose};
+     print "description: $desc\n" if $opt{verbose};
+
+     # put splits into array .. OR store only pace in splits not time AND pace!?
+     #print "splits: @{$TRACKS[$track]->{splits}->{pace}}\n";
+
+     # done with user input
+     # FIXME: store 1k splits into database
+     my $insert = sprintf("INSERT INTO $opt{'database-name'} (hash, startdate, enddate, " .
+			  "filename, trackpoints, name, description, tags," .
+			  " distance, time, times, pace, altmin, altmax," .
+			  " hravg, latmin, latmax, lngmin, lngmax) " .
+#			  " distance, time, times, pace, altmin, altmax, hravg, splits, latmin, latmax, lngmin, lngmax) " .
+			  "VALUES (%s, %d, %d, %s, %d, %s, %s, %s, %f, %d, %d, %d, %d, %d, %d, %f, %f, %f, %f)",
+#			  "VALUES (%s, %d, %d, %s, %d, %s, %s, %s, %f, %d, %d, %d, %d, %d, %f, %f, %f, %f, %s)",
 			  $dbh->quote($TRACKS[$track]->{hash}),
 			  $TRACKS[$track]->{start},
 			  $TRACKS[$track]->{stop},
 			  $dbh->quote(basename($file)),
 			  $TRACKS[$track]->{trackpoints},
+			  $dbh->quote($name),
+			  $dbh->quote($desc),
+			  $dbh->quote($tags),
 			  $TRACKS[$track]->{distance},
 			  $TRACKS[$track]->{time_total_hms},
+			  $TRACKS[$track]->{time_total},
 			  $TRACKS[$track]->{avg_pace},
 			  $TRACKS[$track]->{min_alt},
 			  $TRACKS[$track]->{max_alt},
 			  $TRACKS[$track]->{avg_heartrate},
+			  $TRACKS[$track]->{latmin},
+			  $TRACKS[$track]->{latmax},
+			  $TRACKS[$track]->{lngmin},
+			  $TRACKS[$track]->{lngmax},
+
+			  #$dbh->quote(@{$TRACKS[$track]->{splits}})
 			  );
      print "MySQL insert: $insert\n";
-     $dbh->do($insert);
-
+     $dbh->do($insert) unless $opt{debug};
 }
+
 # xxx simplify options -> relative/hdop ?
 sub write_gpx {
      my $file    = $_[0];
@@ -360,7 +446,7 @@ sub track_handler {
      my $dist		= calc_dist($ntracks);
      my $alt_diff	= calc_alt_diff($ntracks);
      my $avg_hr		= calc_avg_heartrate($ntracks);
-
+     calc_minmax_latlng($ntracks);
 
      # add data to this track
      $TRACKS[$ntracks]->{distance}   = $dist;
@@ -377,8 +463,10 @@ sub track_handler {
      $TRACKS[$ntracks]->{avg_heartrate}  = $avg_hr;
      $TRACKS[$ntracks]->{avg_pace}       = calc_avg_pace($ntracks);
 
+
      dumptrack($ntracks, $opt{verbose}) if $opt{verbose};
      print "End of Track $ntracks\n" if $opt{verbose};
+
 
      $last_trackpt = undef;	#
      $trackpoints = 0;		# reset track points
@@ -386,6 +474,18 @@ sub track_handler {
      $t->purge();		# free this track
 }
 
+my $split_dist = 0;
+my $split_time = 0;
+my $split_pace;
+my @splits;
+sub min($$$) {
+     my $t = ($_[0] < $_[1]) ? $_[0] : $_[1];
+     return ($t < $_[2]) ? $t : $_[2];
+}
+sub max($$$) {
+     my $t = ($_[0] > $_[1]) ? $_[0] : $_[1];
+     return ($t > $_[2]) ? $t : $_[2];
+}
 sub trackpt_handler {
      my ($t, $trackpt) = @_;
 
@@ -402,6 +502,8 @@ sub trackpt_handler {
      my $pace  = 0;
      my $speed = 0;
      my $dtime = 0;
+
+
      # set dist, pace, speed for each track point
      # $var_ is value from last trackpoint
      # $var is current trackpoint value
@@ -412,10 +514,21 @@ sub trackpt_handler {
 	  my $time_ = str2time($last_trackpt->first_child_text('Time'));
 	  $dtime = $time - $time_;
 	  $dist = calc_ddist($lon_, $lat_, $lon, $lat);
+	  $split_dist += $dist;
+	  $split_time += $dtime;
+	  if ($split_dist >= 1.0) {
+	       $split_pace = calc_pace($split_dist, $split_time);
+	       print "1k split time=$split_time, pace=$split_pace\n" if (2 < $opt{verbose});
+	       $split_time = 0;
+	       $split_dist = 0;
+	       push @{$TRACKS[$ntracks]->{splits}}, {time => $split_time, pace => $split_pace};
+	  }
 	  $speed = calc_speed($dist, $dtime);
 	  $pace = calc_pace($dist, $dtime);
+
      }
      $last_trackpt = $trackpt;
+
 
      printf("(%d): t:%d(+%d); alt:%d; hr:%d; lat:%f; lon:%f; d:%.4f; s:%.2f; p:%s\n",
 	    $ntracks, $time, $dtime, $altitude, $heartrate, $lat, $lon, $dist,
@@ -435,7 +548,6 @@ sub trackpt_handler {
 					   speed => $speed,
 					   pace => $pace,
 					  };
-
 
      $trackpoints++;	# increment trackpoint counter for this track
 }
@@ -518,6 +630,38 @@ sub calc_avg_heartrate {
      return sprintf("%.0f", $avg);
 }
 
+#sub calc_track_boundary {
+sub calc_minmax_latlng {
+     my $n = shift;
+     my $last;
+     my $latmin = $TRACKS[$n]->{points}[0]->{latitude};
+     my $latmax = $TRACKS[$n]->{points}[0]->{latitude};
+     my $lngmin = $TRACKS[$n]->{points}[0]->{longitude};
+     my $lngmax = $TRACKS[$n]->{points}[0]->{longitude};
+
+     foreach (@{$TRACKS[$n]->{points}}) {
+	  if ($last) {
+	       if ($latmin > $_->{latitude}) {
+		    $latmin = $_->{latitude};
+	       }
+	       if ($latmax < $_->{latitude}) {
+		    $latmax = $_->{latitude};
+	       }
+	       if ($lngmin > $_->{longitude}) {
+		    $lngmin = $_->{longitude};
+	       }
+	       if ($lngmax < $_->{longitude}) {
+		    $lngmax = $_->{longitude};
+	       }
+	  }
+	  $last = $_;
+     }
+     $TRACKS[$n]->{latmin} = $latmin;
+     $TRACKS[$n]->{latmax} = $latmax;
+     $TRACKS[$n]->{lngmin} = $lngmin;
+     $TRACKS[$n]->{lngmax} = $lngmax;
+}
+
 sub calc_avg_pace {
      my $n = shift;
 
@@ -526,7 +670,7 @@ sub calc_avg_pace {
 }
 
 # FIXME: get total ascending and total descending
-# FIXME: interpolate (smooth) the given altitudes for each point
+# FIXME: interpolate the given altitudes for each point
 # XXX ?: compare and adjust each given height for a point against values from eg. http://www.earthtools.org/
 
 # calculate altitude difference
@@ -732,7 +876,7 @@ sub nice_km {
 
 # dump a track
 # per default print all track details
-# if level greater 1 then also print all points per track
+# if level greater 4 then also print all points per track
 sub dumptrack {
      my $n = shift;
      my $level = shift;
@@ -746,7 +890,20 @@ sub dumptrack {
      printf("total time          = %s\n",   $TRACKS[$n]->{time_total_hms});
      printf("total trackpoints   = %d\n",   $TRACKS[$n]->{trackpoints});
      printf("avg. heartrate      = %d\n", $TRACKS[$n]->{avg_heartrate});
+     printf("min. heartrate      = %d\n", $TRACKS[$n]->{min_hr});
+     printf("max. heartrate      = %d\n", $TRACKS[$n]->{max_hr});
      printf("avg. pace           = %s\n", $TRACKS[$n]->{avg_pace});
+     printf("min. latitude       = %.6f\n", $TRACKS[$n]->{latmin});
+     printf("max. latitude       = %.6f\n", $TRACKS[$n]->{latmax});
+     printf("min. longitude      = %.6f\n", $TRACKS[$n]->{lngmin});
+     printf("max. longitude      = %.6f\n", $TRACKS[$n]->{lngmax});
+
+
+     print "splits:\n";
+     my $km = 1;
+     foreach (@{$TRACKS[$n]->{splits}}) {
+	  printf("%.3dkm: %s\n", $km++, $_->{pace});
+     }
 
      if(4 < $level){
 	  print "Track $n points:\n";
@@ -784,6 +941,7 @@ sub parse_commandline {
 			    "help|h"		=> \$opt{help},
 			    "man"		=> \$opt{man},
 			    "verbose|v+"	=> \$opt{verbose},
+			    "debug"		=> \$opt{debug},
 			    "version|V"		=> sub { print VERSION . "\n"; exit 0; },
 			    "file|f=s"		=> \$opt{file},
 			    "store|s=s"		=> \$opt{store},
@@ -805,7 +963,9 @@ sub parse_commandline {
 			    "remote-dir=s"	=> \$opt{'remote-dir'},
 			    "create-route|R"	=> \$opt{'route'},
 			    "store-file"	=> \$opt{'store-file'},
-			    "store-database"	=> \$opt{'store-database'}
+			    "store-database"	=> \$opt{'store-database'},
+			    "extract=s"		=> \$opt{'extract'},
+			    "no-description"	=> \$opt{'no-description'},
 			   ) or pod2usage(2);
     pod2usage(1) if defined ($opt{help});
     pod2usage(-verbose => 2) if defined ($opt{man});
@@ -836,6 +996,7 @@ foretrain [OPTIONS ...]
 	[--database-host HOSTNAME] [--database-name NAME]
 	[--store-file] [--store-database] [--export-tracks,-e]
 	[--remote-user USER] [--remote-host HOST] [--remote-host DIR]
+	[--extract TRACK_NO] [--no-description]
 
 
 =head1 ABSTRACT
@@ -924,7 +1085,15 @@ Please refer to gpsbabel documentation for usage and option information.
 	NOTE: the path to the script for database backup is hardcoded.
 	The files are copied via scp (assuming ssh keys are stored on server).
 
+=item B<--extract TRACK_NO>
 
+	Extract the track given by its track number (as it is displayed in
+	verbose output). The input file is split into single files stored in
+	/tmp. For the given track number gpx and kml files are stored in /tmp.
+
+=item B<--no-description>
+
+	Do not ask for tags and description for any given track.
 
 =back
 

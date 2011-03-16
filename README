@@ -1,0 +1,7 @@
+Required packages/modules:
+
+sudo cpan -i Geo:Distance
+sudo cpan -i Sys:AlarmCall
+
+sudo apt-get install libgd-graph-perl
+
